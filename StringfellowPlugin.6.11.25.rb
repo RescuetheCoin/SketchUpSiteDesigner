@@ -1,0 +1,2920 @@
+# frozen_string_literal: true
+
+require 'sketchup.rb'
+require 'json'
+require 'time'
+require 'fileutils'
+
+# Return if not running in SketchUp
+return unless defined?(Sketchup) && defined?(UI)
+
+# ------------------------------------------------------------------
+# ActionLogger – captures user & plugin events to JSONL for later review
+# ------------------------------------------------------------------
+module ActionLogger
+  LOG_DIR  = 'Z:/Shared/Templates and Libraries/SketchUp Library/PlugIns/Log Data'.freeze
+  LOG_FILE = 'sketchup_action_log.jsonl'.freeze
+  LOG_PATH = File.join(LOG_DIR, LOG_FILE)
+
+  # Ensure log directory exists
+  FileUtils.mkdir_p(LOG_DIR) unless Dir.exist?(LOG_DIR)
+
+  # Write a generic event payload
+  def self.log_event(payload)
+    entry = { time: Time.now.utc.iso8601 }.merge(payload)
+    begin
+      File.open(LOG_PATH, 'a') { |f| f.puts(entry.to_json) }
+    rescue => e
+      UI.messagebox("ActionLogger error: #{e.message}") if defined?(UI) && UI.respond_to?(:messagebox)
+    end
+  end
+
+  # Log an error with feature context and trimmed backtrace
+  def self.log_error(feature, exception)
+    log_event(
+      event:     'Error',
+      feature:   feature,
+      message:   exception.message,
+      backtrace: exception.backtrace[0..4]
+    )
+  end
+
+  # Observe tool changes
+  class ToolObserver < Sketchup::ToolsObserver
+    def onToolChanged(tools, previous_tool)
+      ActionLogger.log_event(
+        event:         'ToolChanged',
+        new_tool:      tools.class.name,
+        previous_tool: previous_tool && previous_tool.class.name
+      )
+    end
+  end
+
+  # Observe entity additions/removals
+  class EntitiesObserver < Sketchup::EntitiesObserver
+    def onElementAdded(entities, element)
+      # Skip if the element is nil
+      return unless element
+      
+      # Guard against any errors during observation
+      begin
+        case element
+        when Sketchup::Edge
+          # Super cautious validity checking before accessing properties
+          return unless element.valid? rescue false
+          return unless element.start && element.start.valid? rescue false
+          return unless element.end && element.end.valid? rescue false
+          
+          # Only now that we're sure everything is valid, get positions
+          p1 = element.start.position
+          p2 = element.end.position
+          
+          ActionLogger.log_event(
+            event:  'EdgeAdded',
+            length: element.length,
+            start:  [p1.x, p1.y, p1.z],
+            end:    [p2.x, p2.y, p2.z]
+          )
+        when Sketchup::Face
+          # Skip if face is invalid
+          return unless element.valid? rescue false
+          
+          begin
+            area = element.area
+            ActionLogger.log_event(
+              event: 'FaceAdded',
+              area:  area
+            )
+          rescue => e
+            # Specific error handling for face area calculation
+            ActionLogger.log_error('face_area_calculation', e)
+          end
+        end
+      rescue => e
+        # Global error handling for any other issues
+        ActionLogger.log_error('element_added_observer', e)
+      end
+    end
+
+    # Updated for SketchUp 2024: onElementRemoved receives (entities, element)
+    def onElementRemoved(entities, element)
+      # element is the removed object - can't check validity here
+      begin
+        # Be very cautious when accessing deleted objects
+        type = element.class.name rescue 'Unknown'
+        id = nil
+        if element.respond_to?(:persistent_id)
+          begin
+            id = element.persistent_id
+          rescue
+            # Silently ignore errors getting persistent_id from deleted objects
+          end
+        end
+        
+        ActionLogger.log_event(
+          event:     'ElementRemoved',
+          entity_id: id,
+          type:      type
+        )
+      rescue => e
+        ActionLogger.log_error('element_removed_observer', e)
+      end
+    end
+  end
+
+  # Observe selection changes
+  class SelectionObserver < Sketchup::SelectionObserver
+    def onSelectionBulkChange(selection)
+      ids = selection.map(&:persistent_id)
+      ActionLogger.log_event(
+        event:         'SelectionChanged',
+        selection_ids: ids
+      )
+    end
+  end
+
+  # Wrap model operations for logging
+  class ::Sketchup::Model
+    unless method_defined?(:al_original_start_operation)
+      alias_method :al_original_start_operation,  :start_operation
+      alias_method :al_original_commit_operation, :commit_operation
+    end
+
+    def start_operation(name, disable_ui = true, disable_update = false)
+      ActionLogger.log_event(event: 'OperationStart', name: name)
+      al_original_start_operation(name, disable_ui, disable_update)
+    end
+
+    def commit_operation(*args)
+      result = al_original_commit_operation(*args)
+      ActionLogger.log_event(event: 'OperationCommit')
+      result
+    end
+  end
+
+  unless @action_logger_installed
+    mdl = Sketchup.active_model
+    mdl.tools.add_observer(ToolObserver.new)
+    mdl.entities.add_observer(EntitiesObserver.new)
+    mdl.selection.add_observer(SelectionObserver.new)
+    # Only show startup message on first installation (removed popup)
+    @action_logger_installed = true
+  end
+end
+
+# ------------------------------------------------------------------
+# Stringfellow Design Assistant – core plugin
+#------------------------------------------------------------------
+module StringfellowDesignAssistant
+  # Constants
+  CATEGORY_COLORS = {
+    'Estate Homes'     => [255, 222, 201],
+    'Garden Homes'     => [255, 255, 153],
+    'Bungalows'        => [255, 199, 50],
+    'Townhomes'        => [255, 178, 101],
+    'Multi-Family'     => [204, 102,   0],
+    'Office'           => [160,  82,  45],
+    'Commercial'       => [205,  92,  93],
+    'Open Space'       => [115, 155,  67],
+    'Wetlands'         => [ 64,  99,   5],
+    'Wetland Buffer'   => [ 91, 115,  63],
+    'Stormwater Ponds' => [145, 183, 247],
+    'Asphalt'          => [170, 170, 170],
+    'Concrete'         => [255, 255, 255],
+    'Easements'        => [153, 255, 153]
+  }.freeze
+  
+  # Lot parameters by residential category
+  LOT_PARAMETERS = {
+    'Estate Homes'   => { min_width: 80.0 },
+    'Garden Homes'   => { min_width: 60.0 },
+    'Bungalows'      => { min_width: 50.0 }
+  }.freeze
+  
+  # Define residential categories that support subdivision
+  RESIDENTIAL_CATEGORIES = ['Estate Homes', 'Garden Homes', 'Bungalows'].freeze
+  
+  TOLERANCE     = 10
+  SQFT_PER_SQIN = 1.0 / 144.0
+  SQFT_PER_ACRE = 43_560.0
+
+  # Constants for edge cleaning
+  STRAY_THRESHOLD_DEFAULT = 0.5     # inches
+  VERTEX_TOLERANCE_DEFAULT = 0.001  # inches
+  COLINEAR_ANGLE_DEFAULT = 1.0      # degrees
+  MAX_EXTENSION_DISTANCE = 1000.0   # inches
+
+  # Group cleanup parameters for easier management
+  CLEANUP_DEFAULTS = {
+    stray: STRAY_THRESHOLD_DEFAULT.inch,
+    vertex_tol: VERTEX_TOLERANCE_DEFAULT.inch,
+    colinear_deg: COLINEAR_ANGLE_DEFAULT.degrees,
+    max_ext: MAX_EXTENSION_DISTANCE.inch
+  }.freeze
+  
+  # UI text constants
+  CLEANUP_PROMPTS = [
+    'Layers to process (comma-separated, blank for all)', 
+    'Tiny stray threshold (inches)', 
+    'Vertex merge tolerance (inches)',
+    'Colinear angle tolerance (degrees)',
+    'Create faces in closed loops?',
+    'Process entire model?'
+  ].freeze
+  
+  CLEANUP_DEFAULTS_UI = [
+    '',
+    STRAY_THRESHOLD_DEFAULT.to_s,
+    VERTEX_TOLERANCE_DEFAULT.to_s,
+    COLINEAR_ANGLE_DEFAULT.to_s,
+    'Yes',
+    'Yes'
+  ].freeze
+  
+  CLEANUP_DROPDOWNS = [
+    '',
+    '',
+    '',
+    '',
+    'Yes|No',
+    'Yes|No'
+  ].freeze
+
+  # Add this constant somewhere in the constants section
+  LOG_EDGE_CLEANUP = true  # Default to enabled
+
+  # Utility
+  def self.color_close?(a, b)
+    (0..2).all? { |i| (a[i] - b[i]).abs <= TOLERANCE }
+  end
+
+  def self.face_color(face)
+    mat = face.material || face.back_material
+    return unless mat.is_a?(Sketchup::Color)
+    [mat.red, mat.green, mat.blue]
+  end
+
+  def self.ensure_layer(name)
+    layers = Sketchup.active_model.layers
+    layers[name] || layers.add(name)
+  end
+
+  # Recursive traversal
+  def self.traverse_entities(entities, path = [], tf = Geom::Transformation.new)
+    entities.each do |e|
+      case e
+      when Sketchup::Face, Sketchup::Edge
+        yield(e, path, tf)
+      when Sketchup::Group
+        new_path = path + ["Group:#{e.name}"]
+        traverse_entities(e.entities, new_path, tf * e.transformation) { |*a| yield(*a) }
+      when Sketchup::ComponentInstance
+        yield(e, path, tf)
+        new_path = path + ["Comp:#{e.definition.name}"]
+        traverse_entities(e.definition.entities, new_path, tf * e.transformation) { |*a| yield(*a) }
+      end
+    end
+  end
+
+  # Build face adjacency
+  def self.build_adjacency(faces_data, edges_data)
+    adj = Hash.new { |h, k| h[k] = [] }
+    edges_data.each do |ed|
+      ed[:faces].combination(2) do |f1, f2|
+        adj[f1] << f2 unless adj[f1].include?(f2)
+        adj[f2] << f1 unless adj[f2].include?(f1)
+      end
+    end
+    adj
+  end
+
+  # Dissect model → JSON
+  def self.dissect_model
+    model      = Sketchup.active_model
+    vertices   = []
+    v_index    = {}
+    faces_data = []
+    edges_data = []
+    comps_data = []
+
+    # Helper to intern world‐space vertices
+    intern = ->(pt) do
+      key = [pt.x, pt.y, pt.z]
+      v_index[key] ||= vertices.size.tap { vertices << key }
+    end
+
+    traverse_entities(model.entities) do |ent, path, tf|
+      case ent
+      when Sketchup::Face
+        loops = ent.loops.map { |lp| lp.vertices.map { |v| intern.call(tf * v.position) } }
+        faces_data << { id: ent.persistent_id, loops: loops, path: path }
+      when Sketchup::Edge
+        i1   = intern.call(tf * ent.start.position)
+        i2   = intern.call(tf * ent.end.position)
+        fids = ent.faces.map(&:persistent_id)
+        edges_data << {
+          id:       ent.persistent_id,
+          v1:       i1,
+          v2:       i2,
+          faces:    fids,
+          length:   (ent.length * SQFT_PER_SQIN).round(6),
+          path:     path
+        }
+      when Sketchup::ComponentInstance
+        tfw = tf * ent.transformation
+        comps_data << {
+          id:         ent.persistent_id,
+          definition: ent.definition.name,
+          transform:  tfw.to_a,
+          path:       path + ["Comp:#{ent.definition.name}"]
+        }
+      end
+    end
+
+    payload = {
+      vertices:   vertices,
+      faces:      faces_data,
+      edges:      edges_data,
+      components: comps_data,
+      adjacency:  build_adjacency(faces_data, edges_data)
+    }
+
+    # Write JSON to the ActionLogger directory
+    output_dir = ActionLogger::LOG_DIR
+    FileUtils.mkdir_p(output_dir) unless Dir.exist?(output_dir)
+    file = File.join(output_dir, 'dissect_model_connectivity.json')
+
+    begin
+      File.open(file, 'w') { |f| f.write(JSON.pretty_generate(payload)) }
+      if defined?(UI) && UI.respond_to?(:messagebox)
+        UI.messagebox("🔍 Dissect Model written to:\n#{file}")
+      end
+    rescue => e
+      ActionLogger.log_error('dissect_model', e)
+      if defined?(UI) && UI.respond_to?(:messagebox)
+        UI.messagebox("❌ dissect_model error: #{e.message}")
+      end
+    end
+  end
+
+
+# Fix stray edges, extend chains, and create faces
+ 
+  def self.fix_edges
+    model     = Sketchup.active_model
+    ents      = model.active_entities
+    threshold = 4.inch
+    max_ray_dist = 36.inch
+
+    # Adjust model tolerances for accurate gap resolution
+    model_options = model.options
+    tol = model_options["UnitsOptions"]
+    tol["LengthPrecision"] = 3  # 1/1000"
+    tol["LengthSnapEnabled"] = false
+    tol["LengthUnits"] = 0      # Inches
+
+    model.start_operation('Fix Edges', true, false)
+    begin
+      edges = ents.grep(Sketchup::Edge)
+      remove_strays(edges, threshold)
+      edges = ents.grep(Sketchup::Edge) # refresh after deletion
+      chains = build_edge_chains(edges)
+      extend_chains(chains, ents, model, max_ray_dist)
+    rescue => e
+      ActionLogger.log_error('fix_edges', e)
+      UI.messagebox("❌ fix_edges error: #{e.message}") if defined?(UI) && UI.respond_to?(:messagebox)
+    ensure
+      model.commit_operation
+    end
+  end
+
+  def self.remove_strays(edges, threshold)
+    edges.each { |e| e.erase! if e.valid? && e.length < threshold }
+  end
+
+  def self.build_edge_chains(edges)
+    visited = {}
+    chains  = []
+    edges.each do |e|
+      next if visited[e] || !e.valid?
+      visited[e] = true
+      chain = [e]
+      chain = extend_chain(chain, visited, true)
+      chain = extend_chain(chain, visited, false)
+      chains << chain
+    end
+    chains
+  end
+
+  def self.extend_chain(chain, visited, forward)
+    loop do
+      edge    = forward ? chain.last : chain.first
+      free_v  = forward ? edge.end : edge.start
+      prev_v  = forward ? edge.start : edge.end
+      dir_vec = prev_v.position.vector_to(free_v.position).normalize
+      cands   = free_v.edges.reject { |x| visited[x] || !x.valid? }
+      break if cands.empty?
+      best, min_ang = nil, Math::PI
+      cands.each do |cand|
+        other_v = cand.start == free_v ? cand.end : cand.start
+        cand_vec = free_v.position.vector_to(other_v.position).normalize
+        ang      = dir_vec.angle_between(cand_vec)
+        if ang < min_ang
+          min_ang = ang; best = cand
+        end
+      end
+      break unless best
+      visited[best] = true
+      forward ? chain.push(best) : chain.unshift(best)
+    end
+    chain
+  end
+
+  def self.extend_chains(chains, ents, model, max_dist)
+    chains.each do |chain|
+      next if chain.empty?
+      [[chain.first, false], [chain.last, true]].each do |edge, forward|
+        next unless edge.valid?
+        free_v = forward ? edge.end : edge.start
+        prev_v = forward ? edge.start : edge.end
+        dir    = prev_v.position.vector_to(free_v.position).normalize
+        res    = model.raytest([free_v.position, dir])
+        next unless res && res[0].is_a?(Geom::Point3d)
+        next if res[0].distance(free_v.position) > max_dist
+        ents.add_line(free_v.position, res[0])
+      end
+    end
+  end
+
+  # Enhanced edge fixing with tag selection and advanced cleanup
+  # @param none
+  # @return [void]
+  # @example
+  #   StringfellowDesignAssistant.enhanced_fix_edges
+  def self.enhanced_fix_edges
+    model = Sketchup.active_model
+    
+    # Get all layers/tags in the model
+    all_layers = model.layers.to_a.map(&:name)
+    
+    # Configure cleanup parameters
+    results = UI.inputbox(CLEANUP_PROMPTS, CLEANUP_DEFAULTS_UI, CLEANUP_DROPDOWNS, 'Enhanced Edge Cleanup')
+    return unless results
+    
+    # Parse user input with better variable names
+    layer_filter = results[0].strip
+    stray_threshold = results[1].to_f.inch
+    vertex_tolerance = results[2].to_f.inch
+    colinear_tolerance = results[3].to_f.degrees
+    create_faces = results[4].strip.casecmp?('yes')
+    process_entire_model = results[5].strip.casecmp?('yes')
+    
+    selected_layers = layer_filter.empty? ? all_layers : layer_filter.split(',').map(&:strip)
+    
+    # Determine which entities to process
+    if process_entire_model
+      ents = model.entities
+    else
+      # See if a group or component is selected
+      selection = model.selection
+      if selection.length == 1 && (selection[0].is_a?(Sketchup::Group) || selection[0].is_a?(Sketchup::ComponentInstance))
+        if selection[0].is_a?(Sketchup::Group)
+          ents = selection[0].entities
+        else
+          ents = selection[0].definition.entities
+        end
+      else
+        ents = model.active_entities
+      end
+    end
+    
+    # Start the operation
+    model.start_operation('Enhanced Edge Cleanup', true,false)
+    
+    begin
+      # 1. Collect all edges to process based on tag selection
+      all_edges = ents.grep(Sketchup::Edge).to_a # Convert to array to avoid mutating while iterating
+      edges_to_process = all_edges.select do |edge|
+        edge && (edge.valid? rescue false) && edge.layer && 
+        selected_layers.include?(edge.layer.name.to_s)
+      end
+      
+      # If no edges match the tag filter, use all valid edges
+      if edges_to_process.empty?
+        edges_to_process = all_edges.select { |edge| edge && (edge.valid? rescue false) }
+      end
+      
+            # 2. Remove tiny stray edges (collect first, then erase)      edges_to_erase = []      stray_count = 0            edges_to_process.each do |edge|        if edge && (edge.valid? rescue false) && edge.length < stray_threshold          edges_to_erase << edge          stray_count += 1        end                # Check for cancel every 1000 edges        if stray_count % 1000 == 0 && escape_pressed?          model.abort_operation          self.show_message("Edge cleanup cancelled by user.")          return        end      end
+      
+      # Now erase all strays at once
+      erase_edges(edges_to_erase)
+      
+      # 3. Merge duplicate vertices (those closer than tolerance)
+      merged_count = merge_close_vertices!(ents, edges_to_process, vertex_tolerance)
+      
+      # 4. Purge unused entities if possible
+      ents.purge_unused(true) if ents.respond_to?(:purge_unused)
+      
+      # 5. Build chains of edges
+      chains = build_enhanced_edge_chains(ents.grep(Sketchup::Edge).select(&:valid?))
+      
+      # Remove any stray nils from every chain right after building them
+      chains.each(&:compact!)
+      
+      # 6. Merge colinear segments within chains
+      colinear_merged = 0
+      chains.each do |chain|
+        colinear_merged += merge_colinear_segments(chain, ents, colinear_tolerance)
+      end
+      
+      # Remove any stray nils from every chain
+      chains.each(&:compact!)
+      
+      # 7. Extend chains where possible
+      extended = extend_enhanced_chains(chains, ents, model)
+      
+      # 8. Create faces in closed loops if requested
+      faces_created = create_faces ? build_faces_from_loops!(chains, ents) : 0
+      
+      # Report results
+      result_message = "Edge cleanup complete:\n"
+      result_message += "• #{stray_count} tiny stray edges removed\n"
+      result_message += "• #{merged_count} duplicate vertices merged\n"
+      result_message += "• #{colinear_merged} colinear segments merged\n"
+      result_message += "• #{extended} chain endpoints extended\n"
+      result_message += "• #{faces_created} faces created" if create_faces
+      
+      UI.messagebox(result_message) if defined?(UI) && UI.respond_to?(:messagebox)
+    rescue => e
+      ActionLogger.log_error('enhanced_fix_edges', e)
+      UI.messagebox("❌ Enhanced edge cleanup error: #{e.message}") if defined?(UI) && UI.respond_to?(:messagebox)
+    ensure
+      model.commit_operation
+    end
+  end
+  
+  # Helper method to erase multiple edges (original implementation)
+  # @param edges [Array<Sketchup::Edge>] edges to erase
+  # @return [void]
+  def self.erase_edges(edges)
+    # Forward to the safer implementation at the end of the file
+    self.erase_edges_safely(edges)
+  end
+
+  # Helper method to safely erase a collection of edges
+  # @param edges [Array<Sketchup::Edge>] edges to erase
+  # @return [void]
+  def self.erase_edges_safely(edges)
+    return unless edges && !edges.empty?
+    
+    begin
+      # Filter and erase valid edges only
+      edges.each do |edge|
+        if edge && (edge.valid? rescue false)
+          begin
+            edge.erase!
+          rescue => e
+            # Log error but continue with other edges
+            ActionLogger.log_error('erase_edge', e) if defined?(ActionLogger)
+          end
+        end
+      end
+    rescue => e
+      # Catch any unexpected errors
+      ActionLogger.log_error('erase_edges_batch', e) if defined?(ActionLogger)
+    end
+  end
+  
+  # Helper method to create multiple edges
+  # @param ents [Sketchup::Entities] entities collection to add to
+  # @param segments [Array<Array<Geom::Point3d>>] array of point pairs
+  # @return [Array<Sketchup::Edge>] newly created edges
+  def self.create_edges(ents, segments)
+    return [] unless ents && segments && !segments.empty?
+    
+    result = []
+    segments.each do |points|
+      begin
+        next unless points && points.size >= 2
+        p1, p2 = points
+        next unless p1 && p2
+        
+        new_edge = ents.add_line(p1, p2)
+        result << new_edge if new_edge
+      rescue => e
+        ActionLogger.log_error('create_edge', e) if defined?(ActionLogger)
+      end
+    end
+    result
+  end
+  
+  # Helper to create faces from chains that form closed loops
+  # @param chains [Array<Array<Sketchup::Edge>>] array of edge chains
+  # @param ents [Sketchup::Entities] entities collection to add faces to
+  # @param created_faces [Array] optional array to store created faces for logging
+  # @return [Integer] number of faces created
+  def self.build_faces_from_loops!(chains, ents, created_faces = nil)
+    return 0 if chains.nil? || ents.nil?
+    
+    faces_created = 0
+    
+    chains.each do |chain|
+      # Skip chains that are nil or too short to form a face
+      next if chain.nil? || chain.length < 3
+      
+      # Ensure all edges in the chain are still valid
+      begin
+        valid_chain = chain.select { |edge| edge && (edge.valid? rescue false) }
+        # Skip if we've lost too many edges to form a face
+        next if valid_chain.length < 3
+        
+        # Only proceed if we have a closed loop, checking with rescue to handle any validity issues
+        is_closed = false
+        begin
+          is_closed = chain_is_closed?(valid_chain)
+        rescue => e
+          ActionLogger.log_error('check_chain_closed', e)
+          next
+        end
+        
+        if is_closed
+          # Get unique vertices in the correct order, with error handling
+          vertices = []
+          ordered_edges = []
+          
+          # Start with the first valid edge
+          current_edge = valid_chain.first
+          
+          # Skip if the first edge is somehow invalid
+          next unless current_edge && (current_edge.valid? rescue false)
+          
+          # Get a valid start vertex
+          current_vertex = nil
+          begin
+            current_vertex = current_edge.start
+            next unless current_vertex && (current_vertex.valid? rescue false)
+          rescue => e
+            ActionLogger.log_error('get_start_vertex', e)
+            next
+          end
+          
+          # Trace the entire loop, following connected edges with extensive error handling
+          valid_loop = true
+          begin
+            valid_chain.length.times do
+              # Add current vertex to the vertices list if it's valid
+              if current_vertex && (current_vertex.valid? rescue false)
+                vertices << current_vertex
+                ordered_edges << current_edge
+              else
+                valid_loop = false
+                break
+              end
+              
+              # Find the next edge connected to the current vertex
+              begin
+                next_edge = find_next_edge(current_vertex, current_edge, valid_chain)
+                break unless next_edge && (next_edge.valid? rescue false)
+                
+                # Find the vertex at the other end of the next edge
+                next_vertex = nil
+                begin
+                  next_vertex = other_vertex(next_edge, current_vertex)
+                  break unless next_vertex && (next_vertex.valid? rescue false)
+                  
+                  # Continue the chain
+                  current_edge = next_edge
+                  current_vertex = next_vertex
+                rescue => e
+                  ActionLogger.log_error('get_next_vertex', e)
+                  valid_loop = false
+                  break
+                end
+              rescue => e
+                ActionLogger.log_error('find_next_edge', e)
+                valid_loop = false
+                break
+              end
+            end
+          rescue => e
+            ActionLogger.log_error('trace_edge_loop', e)
+            valid_loop = false
+          end
+          
+          # Skip if we couldn't trace a valid loop
+          next unless valid_loop && vertices.size >= 3
+          
+          # Verify we have a true closed loop (last vertex connects back to first)
+          begin
+            # Skip if the first or last vertex is invalid
+            next unless vertices.first && (vertices.first.valid? rescue false) && 
+                        vertices.last && (vertices.last.valid? rescue false)
+            
+            # Get the positions
+            first_pos = vertices.first.position
+            last_pos = vertices.last.position
+            
+            # Check if the loop is closed (endpoints are close enough)
+            if first_pos.distance(last_pos) <= 0.001.inch
+              # Get unique positions while preserving order (required for face creation)
+              position_points = []
+              seen_positions = {}
+              
+              # Collect valid positions
+              vertices.each do |v|
+                begin
+                  next unless v && (v.valid? rescue false)
+                  
+                  # Get the position
+                  pos = v.position
+                  
+                  # Skip duplicate positions while preserving order
+                  rounded_pos = [pos.x.round(6), pos.y.round(6), pos.z.round(6)]
+                  
+                  unless seen_positions[rounded_pos]
+                    position_points << pos
+                    seen_positions[rounded_pos] = true
+                  end
+                rescue => e
+                  ActionLogger.log_error('collect_positions', e)
+                end
+              end
+              
+              # Make sure we have at least 3 unique points for a valid face
+              if position_points.size >= 3
+                # Check if points are roughly coplanar (using the normal calculation)
+                begin
+                  # Calculate an approximate normal by using the first three points
+                  p1, p2, p3 = position_points[0], position_points[1], position_points[2]
+                  v1 = p2 - p1
+                  v2 = p3 - p1
+                  normal = v1 * v2  # Cross product
+                  
+                  # Skip if normal is too short (indicates collinear points)
+                  next if normal.length < 0.0001.inch
+                  
+                  # Simple test for self-intersection - check if any non-adjacent edges cross
+                  has_self_intersection = false
+                  
+                  if position_points.size > 3
+                    # Perform a basic self-intersection test
+                    begin
+                      # Very simple test: just check if any non-adjacent line segments intersect
+                      # This is not comprehensive but catches many issues
+                      (0...position_points.size).each do |i|
+                        next_i = (i + 1) % position_points.size
+                        p1, p2 = position_points[i], position_points[next_i]
+                        
+                        ((i + 2) % position_points.size...((i - 1) % position_points.size)).each do |j|
+                          j = j % position_points.size
+                          next_j = (j + 1) % position_points.size
+                          p3, p4 = position_points[j], position_points[next_j]
+                          
+                          # Skip adjacent edges
+                          next if next_i == j || i == next_j
+                          
+                          # Very simple intersection test in 2D (ignore Z)
+                          begin
+                            if segments_intersect_2d(p1, p2, p3, p4)
+                              has_self_intersection = true
+                              break
+                            end
+                          rescue => e
+                            ActionLogger.log_error('segment_intersection', e)
+                          end
+                        end
+                        break if has_self_intersection
+                      end
+                    rescue => e
+                      ActionLogger.log_error('self_intersection_check', e)
+                    end
+                  end
+                  
+                  # Skip if self-intersection detected
+                  next if has_self_intersection
+                  
+                  # Create the face
+                  face = nil
+                  begin
+                    face = ents.add_face(position_points)
+                    
+                    # Check if face was created successfully
+                    if face && (face.valid? rescue false)
+                      # Add face to logging array if enabled
+                      created_faces << face if created_faces
+                      
+                      faces_created += 1
+                      
+                      # Orient face normal to point "upward" if possible
+                      if face.normal.z < 0
+                        face.reverse!
+                      end
+                    end
+                  rescue => e
+                    ActionLogger.log_error('face_creation', e)
+                  end
+                rescue => e
+                  # Some loops may have numerical issues, we just skip those
+                  ActionLogger.log_error('face_geometry_calculation', e)
+                end
+              end
+            end
+          rescue => e
+            ActionLogger.log_error('check_closed_loop', e)
+          end
+        end
+      rescue => e
+        ActionLogger.log_error('build_face_from_chain', e)
+      end
+    end
+    
+    faces_created
+  end
+  
+  # Helper method to check if two 2D line segments intersect
+  # @param p1 [Geom::Point3d] first point of first segment
+  # @param p2 [Geom::Point3d] second point of first segment
+  # @param p3 [Geom::Point3d] first point of second segment
+  # @param p4 [Geom::Point3d] second point of second segment
+  # @return [Boolean] true if segments intersect in 2D (ignoring Z)
+  def self.segments_intersect_2d(p1, p2, p3, p4)
+    # Calculate direction vectors
+    d1 = Geom::Vector3d.new(p2.x - p1.x, p2.y - p1.y, 0)
+    d2 = Geom::Vector3d.new(p4.x - p3.x, p4.y - p3.y, 0)
+    d3 = Geom::Vector3d.new(p3.x - p1.x, p3.y - p1.y, 0)
+    
+    # Calculate determinants
+    denom = (d2.y * d1.x) - (d2.x * d1.y)
+    return false if denom.abs < 0.0001  # Parallel or collinear
+    
+    ua = ((d2.x * d3.y) - (d2.y * d3.x)) / denom
+    ub = ((d1.x * d3.y) - (d1.y * d3.x)) / denom
+    
+    # Check if intersection point is within both segments
+    ua >= 0 && ua <= 1 && ub >= 0 && ub <= 1
+  end
+  
+  # Merge vertices that are closer than tolerance
+  # @param ents [Sketchup::Entities] entities collection
+  # @param edges [Array<Sketchup::Edge>] edges to process
+  # @param tolerance [Float] distance tolerance for merging
+  # @param vertex_pairs_merged [Array] optional array to store merged vertex pairs for logging
+  # @return [Integer] number of vertices merged
+  def self.merge_close_vertices!(ents, edges, tolerance, vertex_pairs_merged = nil)
+    # Safety check for inputs
+    return 0 unless ents && edges
+    
+    # Build spatial index for vertices (rounded coordinates → vertex)
+    v_index = Hash.new { |h, k| h[k] = [] }
+    
+    # Update our edges list after removing strays - skip invalid edges
+    edges = edges.select { |edge| edge && edge.valid? rescue false }
+    return 0 if edges.empty?
+    
+    # Collect all vertices from remaining edges, checking validity
+    vertices = []
+    edges.each do |edge|
+      begin
+        if edge.valid? && edge.start && edge.start.valid?
+          vertices << edge.start unless vertices.include?(edge.start)
+        end
+        
+        if edge.valid? && edge.end && edge.end.valid?
+          vertices << edge.end unless vertices.include?(edge.end)
+        end
+      rescue => e
+        # Skip edges with deleted vertices
+        ActionLogger.log_error('collect_vertices', e)
+      end
+    end
+    
+    # Skip if no valid vertices to process
+    return 0 if vertices.empty?
+    
+    # Index vertices by rounded coordinates for quick lookup
+    scale = 1.0 / tolerance
+    vertices.each do |v|
+      begin
+        next unless v && v.valid?
+        position = v.position
+        key = [
+          (position.x * scale).round,
+          (position.y * scale).round,
+          (position.z * scale).round
+        ]
+        v_index[key] << v
+      rescue => e
+        # Skip vertices that can't be indexed
+        ActionLogger.log_error('vertex_indexing', e)
+      end
+    end
+    
+    # Prepare edge operations for vertex merging
+    edges_to_create = []
+    edges_to_erase_for_merge = []
+    merged_count = 0
+    
+    v_index.each_value do |vertex_list|
+      # Skip if we don't have multiple vertices at this location
+      next if vertex_list.size <= 1
+      
+      # Filter for valid vertices only
+      valid_vertices = vertex_list.select { |v| v && v.valid? rescue false }
+      next if valid_vertices.size <= 1
+      
+      # Use the first vertex as the "master" vertex
+      master = valid_vertices.first
+      next unless master.valid?
+      
+      # Move all other vertices to the master position
+      valid_vertices[1..-1].each do |v|
+        begin
+          next unless v.valid?
+          
+          # Record the vertex pair being merged if logging is enabled
+          vertex_pairs_merged << [master, v] if vertex_pairs_merged
+          
+          # Find all edges connected to this vertex
+          connected_edges = v.edges.select { |e| e && e.valid? rescue false }
+          
+          connected_edges.each do |edge|
+            begin
+              next unless edge.valid?
+              
+              # Store edge to be erased
+              edges_to_erase_for_merge << edge
+              
+              # Get the other endpoint, checking for validity
+              other_end = nil
+              if edge.start == v && edge.end && edge.end.valid?
+                other_end = edge.end
+              elsif edge.end == v && edge.start && edge.start.valid?
+                other_end = edge.start
+              end
+              
+              # Skip if no valid other endpoint
+              next unless other_end && other_end.valid?
+              
+              # Only create if this connection doesn't already exist
+              # Check if master already has an edge to other_end
+              existing_connection = false
+              master_edges = master.edges.select { |e| e && e.valid? rescue false }
+              
+              master_edges.each do |e|
+                if (e.end == other_end || e.start == other_end)
+                  existing_connection = true
+                  break
+                end
+              end
+              
+              unless existing_connection
+                edges_to_create << [master.position, other_end.position]
+              end
+            rescue => e
+              # Skip edges that can't be processed
+              ActionLogger.log_error('edge_processing', e)
+            end
+          end
+          merged_count += 1
+        rescue => e
+          # Skip vertices that can't be merged
+          ActionLogger.log_error('vertex_merging', e)
+        end
+      end
+    end
+    
+    # Apply vertex merging operations
+    # Safely erase edges
+    begin
+      erase_edges(edges_to_erase_for_merge)
+    rescue => e
+      ActionLogger.log_error('erase_edges_for_merge', e)
+    end
+    
+    # Safely create new edges
+    begin
+      create_edges(ents, edges_to_create)
+    rescue => e
+      ActionLogger.log_error('create_edges_for_merge', e)
+    end
+    
+    merged_count
+  end
+  
+  # Helper method to get the "other" vertex of an edge
+  # @param edge [Sketchup::Edge] the edge
+  # @param vertex [Sketchup::Vertex] one vertex of the edge
+  # @return [Sketchup::Vertex] the other vertex of the edge
+  def self.other_vertex(edge, vertex)
+    return nil if edge.nil? || vertex.nil?
+    edge.start == vertex ? edge.end : edge.start
+  end
+  
+  # Helper method to check if a chain is closed
+  # @param chain [Array<Sketchup::Edge>] chain of edges
+  # @return [Boolean] true if chain forms a closed loop
+  def self.chain_is_closed?(chain)
+    return false if chain.nil? || chain.empty?
+    
+    # Get the endpoints of the first and last edges
+    first_edge = chain.first
+    last_edge = chain.last
+    
+    return false if first_edge.nil? || last_edge.nil?
+    
+    # Check if they share an endpoint
+    first_edge.start == last_edge.start ||
+    first_edge.start == last_edge.end ||
+    first_edge.end == last_edge.start ||
+    first_edge.end == last_edge.end
+  end
+  
+  # Helper method to find the next edge in a chain
+  # @param vertex [Sketchup::Vertex] current vertex
+  # @param current_edge [Sketchup::Edge] current edge
+  # @param chain [Array<Sketchup::Edge>] chain of edges
+  # @return [Sketchup::Edge, nil] the next edge or nil if none found
+  def self.find_next_edge(vertex, current_edge, chain)
+    return nil if vertex.nil? || current_edge.nil? || chain.nil?
+    
+    chain.each do |edge|
+      next if edge.nil? || edge == current_edge || !edge.valid?
+      return edge if edge.start == vertex || edge.end == vertex
+    end
+    nil
+  end
+  
+  # Build enhanced edge chains with better connectivity detection
+  # @param edges [Array<Sketchup::Edge>] edges to process
+  # @return [Array<Array<Sketchup::Edge>>] array of edge chains
+  def self.build_enhanced_edge_chains(edges)
+    # Build a graph representation of edges
+    graph = Hash.new { |h, k| h[k] = [] }
+    
+    # We'll modify this collection, so convert to array first
+    edges = edges.to_a
+    
+    edges.each do |edge|
+      next unless edge.valid?
+      graph[edge.start] << [edge.end, edge]
+      graph[edge.end] << [edge.start, edge]
+    end
+    
+    # Find all vertices with exactly one connection (endpoints)
+    endpoints = graph.select { |v, connections| connections.size == 1 }.keys
+    
+    # Start chains from endpoints for better results
+    chains = []
+    visited_edges = {}
+    
+    # First start with endpoints
+    endpoints.each do |start_v|
+      next if graph[start_v].empty?
+      
+      # Get the edge from this endpoint
+      v2, edge = graph[start_v].first
+      next if visited_edges[edge]
+      
+      # Start a new chain
+      chain = [edge]
+      visited_edges[edge] = true
+      
+      # Traverse from v2
+      current_v = v2
+      prev_v = start_v
+      
+      # Follow the chain until we hit an endpoint or junction
+      loop do
+        # Find edges from current_v that aren't the one we just came from
+        next_edges = graph[current_v].reject { |_, e| visited_edges[e] }
+        
+        # If no edges or a junction (more than 1 option), we're done
+        break if next_edges.empty? || next_edges.size > 1
+        
+        # Add this edge to our chain
+        next_v, next_edge = next_edges.first
+        chain << next_edge
+        visited_edges[next_edge] = true
+        
+        # Move to the next vertex
+        prev_v = current_v
+        current_v = next_v
+      end
+      
+      chains << chain
+    end
+    
+    # Then handle any remaining edges (loops and isolated segments)
+    edges.each do |edge|
+      next unless edge.valid?
+      next if visited_edges[edge]
+      
+      # Start a new chain
+      chain = [edge]
+      visited_edges[edge] = true
+      
+      # Try to extend in both directions
+      [
+        [edge.end, edge.start],
+        [edge.start, edge.end]
+      ].each do |current_v, prev_v|
+        # Follow the chain until we hit an endpoint or junction
+        loop do
+          # Find edges from current_v that aren't the one we just came from
+          next_edges = graph[current_v].reject { |_, e| visited_edges[e] }
+          
+          # If no edges or a junction (more than 1 option), we're done
+          break if next_edges.empty? || next_edges.size > 1
+          
+          # Add this edge to our chain (in the correct order)
+          next_v, next_edge = next_edges.first
+          
+          if current_v == edge.end && prev_v == edge.start
+            chain << next_edge # Append to the end
+          else
+            chain.unshift(next_edge) # Prepend to the start
+          end
+          
+          visited_edges[next_edge] = true
+          
+          # Move to the next vertex
+          prev_v = current_v
+          current_v = next_v
+        end
+      end
+      
+      chains << chain
+    end
+    
+    chains
+  end
+  
+  # Merge colinear segments within a chain
+  # @param chain [Array<Sketchup::Edge>] chain of edges
+  # @param ents [Sketchup::Entities] entities collection to modify
+  # @param angle_tolerance [Float] angle tolerance in radians
+  # @param colinear_edges_merged [Array] optional array to store merged edge groups for logging
+  # @return [Integer] number of segments merged
+  def self.merge_colinear_segments(chain, ents, angle_tolerance, colinear_edges_merged = nil)
+    # Basic validation
+    return 0 if chain.nil? || ents.nil? || chain.size < 2
+    
+    # Remove any nil entries from the chain
+    chain.compact!
+    
+    # Ensure we're working with valid edges
+    chain.select! { |edge| edge && (edge.valid? rescue false) }
+    return 0 if chain.size < 2
+    
+    merged_count = 0
+    index = 0
+    
+    while index < chain.size - 1
+      # Skip if either edge is no longer valid - using rescue to handle any errors
+      current_edge = chain[index]
+      next_edge = chain[index + 1]
+      
+      # First validity check with rescue
+      begin
+        # This will raise an error if either edge is invalid
+        unless current_edge && next_edge && current_edge.valid? && next_edge.valid?
+          index += 1
+          next
+        end
+      rescue => e
+        # If any error occurs during validity checking, log and skip
+        ActionLogger.log_error('edge_validity_check', e)
+        index += 1
+        next
+      end
+      
+      # Now verify edge endpoints exist and are valid
+      begin
+        unless current_edge.start && current_edge.end && 
+               next_edge.start && next_edge.end &&
+               current_edge.start.valid? && current_edge.end.valid? && 
+               next_edge.start.valid? && next_edge.end.valid?
+          index += 1
+          next
+        end
+      rescue => e
+        # If any error occurs during endpoint checking, log and skip
+        ActionLogger.log_error('endpoint_validity_check', e)
+        index += 1
+        next
+      end
+      
+      # Find the shared vertex between edges - with extensive error handling
+      shared_vertex = nil
+      
+      # Safely find shared vertex
+      begin
+        # Try to find shared vertex safely, checking each possibility with rescue
+        if (current_edge.start == next_edge.start rescue false) || 
+           (current_edge.start == next_edge.end rescue false)
+          shared_vertex = current_edge.start
+        elsif (current_edge.end == next_edge.start rescue false) || 
+              (current_edge.end == next_edge.end rescue false)
+          shared_vertex = current_edge.end
+        end
+        
+        # Skip if no shared vertex or it's invalid
+        unless shared_vertex && shared_vertex.valid?
+          index += 1
+          next
+        end
+      rescue => e
+        ActionLogger.log_error('find_shared_vertex', e)
+        index += 1
+        next
+      end
+      
+      # Variables for edge direction calculations
+      dir1 = nil
+      dir2 = nil
+      
+      # Safely get position for each vertex
+      begin
+        start_pos = shared_vertex.position
+        
+        # Get positions of other endpoints, with validity checks
+        p1 = nil
+        p2 = nil
+        
+        if (current_edge.start == shared_vertex rescue false)
+          if current_edge.end && current_edge.end.valid?
+            p1 = current_edge.end.position
+          else
+            # Invalid endpoint, skip
+            index += 1
+            next
+          end
+        elsif (current_edge.end == shared_vertex rescue false)
+          if current_edge.start && current_edge.start.valid?
+            p1 = current_edge.start.position
+          else
+            # Invalid endpoint, skip
+            index += 1
+            next
+          end
+        end
+        
+        if (next_edge.start == shared_vertex rescue false)
+          if next_edge.end && next_edge.end.valid?
+            p2 = next_edge.end.position
+          else
+            # Invalid endpoint, skip
+            index += 1
+            next
+          end
+        elsif (next_edge.end == shared_vertex rescue false)
+          if next_edge.start && next_edge.start.valid?
+            p2 = next_edge.start.position
+          else
+            # Invalid endpoint, skip
+            index += 1
+            next
+          end
+        end
+        
+        # Skip if we couldn't get valid endpoints
+        unless p1 && p2
+          index += 1
+          next
+        end
+        
+        # Calculate directions
+        dir1 = (p1 - start_pos).normalize
+        dir2 = (p2 - start_pos).normalize
+        
+        # Check if directions are valid vectors
+        unless dir1.valid? && dir2.valid?
+          index += 1
+          next
+        end
+        
+        # Calculate angle between directions
+        angle = dir1.angle_between(dir2)
+      rescue => e
+        ActionLogger.log_error('calculate_directions', e)
+        index += 1
+        next
+      end
+      
+      # Check if angles indicate colinear segments (nearly opposite directions)
+      begin
+        if (angle > 3.14159 - angle_tolerance) || (angle < angle_tolerance)
+          # At this point we have valid p1 and p2 from above
+          
+          # Create the replacement edge inside a begin/rescue block
+          new_edge = nil
+          begin
+            # Create new edge connecting the non-shared endpoints
+            new_edge = ents.add_line(p1, p2)
+            
+            # Record the edges being merged if logging is enabled
+            merged_edges = [current_edge, next_edge]
+            
+            # Copy properties from the original edge (layer, etc) if still valid
+            if current_edge && current_edge.valid? && current_edge.layer
+              new_edge.layer = current_edge.layer
+            end
+            
+            # Safely erase the original edges
+            begin
+              if current_edge && (current_edge.valid? rescue false)
+                current_edge.erase!
+              end
+            rescue => e
+              ActionLogger.log_error('erase_current_edge', e)
+            end
+            
+            begin
+              if next_edge && (next_edge.valid? rescue false)
+                next_edge.erase!
+              end
+            rescue => e
+              ActionLogger.log_error('erase_next_edge', e)
+            end
+            
+            # Update the chain - replace both edges with the new one
+            chain[index] = new_edge
+            chain.delete_at(index + 1)  # Remove the second edge
+            
+            # Log the merged edges if requested
+            if colinear_edges_merged
+              colinear_edges_merged << merged_edges
+            end
+            
+            merged_count += 1
+            
+            # Don't increment index since we've modified the array
+            # and the next edge is now at the current position
+          rescue => e
+            # If creating the new edge fails, skip this pair
+            ActionLogger.log_error('create_merged_edge', e)
+            index += 1
+          end
+        else
+          # Not colinear, move to next pair
+          index += 1
+        end
+      rescue => e
+        # Catch any other errors in the colinearity check and merge process
+        ActionLogger.log_error('merge_colinear_process', e)
+        index += 1
+      end
+    end
+    
+    # Ensure we return a valid number
+    merged_count
+  end
+  
+  # Extend chains where endpoints are close to each other
+  # @param chains [Array<Array<Sketchup::Edge>>] array of edge chains
+  # @param ents [Sketchup::Entities] entities collection to modify
+  # @param model [Sketchup::Model] model for creating temp groups
+  # @param extended_pairs [Array] optional array to store extended edge pairs for logging
+  # @return [Integer] number of extensions made
+  def self.extend_enhanced_chains(chains, ents, model, extended_pairs = nil)
+    return 0 if chains.nil? || ents.nil? || model.nil?
+    
+    # Remove any nils from chains
+    chains.each(&:compact!)
+    
+    # Skip empty chains
+    chains.reject!(&:empty?)
+    return 0 if chains.empty?
+    
+    # Find all endpoint vertices of chains
+    endpoints = []
+    
+    chains.each do |chain|
+      # Skip empty or invalid chains
+      next if chain.empty? || !chain.first.valid?
+      
+      # Skip closed loops
+      next if chain_is_closed?(chain)
+      
+      # Get first and last edges
+      first_edge = chain.first
+      last_edge = chain.last
+      
+      next unless first_edge && last_edge && first_edge.valid? && last_edge.valid?
+      
+      # Find disconnected endpoints of the chain
+      if chain.size == 1
+        # Single edge chain - both endpoints are free
+        endpoints << { vertex: first_edge.start, edge: first_edge, chain: chain }
+        endpoints << { vertex: first_edge.end, edge: first_edge, chain: chain }
+      else
+        # First endpoint:
+        # Find which vertex of the first edge doesn't connect to the second edge
+        free_vertex = nil
+        
+        if chain.size > 1 && chain[1] && chain[1].valid?
+          second_edge = chain[1]
+          if first_edge.start == second_edge.start || first_edge.start == second_edge.end
+            free_vertex = first_edge.end
+          else
+            free_vertex = first_edge.start
+          end
+        else
+          # Default to start if we can't determine
+          free_vertex = first_edge.start
+        end
+        
+        endpoints << { vertex: free_vertex, edge: first_edge, chain: chain, position: :start }
+        
+        # Last endpoint:
+        # Find which vertex of the last edge doesn't connect to the second-to-last edge
+        free_vertex = nil
+        
+        if chain.size > 1 && chain[-2] && chain[-2].valid?
+          second_last_edge = chain[-2]
+          if last_edge.start == second_last_edge.start || last_edge.start == second_last_edge.end
+            free_vertex = last_edge.end
+          else
+            free_vertex = last_edge.start
+          end
+        else
+          # Default to end if we can't determine
+          free_vertex = last_edge.end
+        end
+        
+        endpoints << { vertex: free_vertex, edge: last_edge, chain: chain, position: :end }
+      end
+    end
+    
+    # Skip if no endpoints
+    return 0 if endpoints.empty?
+    
+    # Create a spatial index for finding nearby endpoints
+    extension_dist = 0.1.inch  # Starting small - we'll increase this if needed
+    max_dist = MAX_EXTENSION_DISTANCE
+    extension_count = 0
+    
+    # Attempt extension at increasing distances
+    while extension_dist < max_dist && extension_count == 0
+      # Double the distance each time
+      extension_dist *= 2
+      
+      # Try to extend endpoints that are within our current distance
+      endpoints.combination(2).each do |e1, e2|
+        # Skip if either vertex is no longer valid
+        next unless e1[:vertex].valid? && e2[:vertex].valid?
+        
+        # Skip if these are from the same chain
+        next if e1[:chain] == e2[:chain]
+        
+        # Check distance between vertices
+        p1 = e1[:vertex].position
+        p2 = e2[:vertex].position
+        dist = p1.distance(p2)
+        
+        if dist <= extension_dist
+          # These endpoints are close enough to connect
+          begin
+            # Create new edge connecting these endpoints
+            new_edge = ents.add_line(p1, p2)
+            
+            # Inherit layer from one of the original edges
+            if e1[:edge].layer
+              new_edge.layer = e1[:edge].layer
+            elsif e2[:edge].layer
+              new_edge.layer = e2[:edge].layer
+            end
+            
+            # Add this edge to both chains
+            if e1[:position] == :start
+              e1[:chain].unshift(new_edge)
+            else
+              e1[:chain] << new_edge
+            end
+            
+            if e2[:position] == :start
+              e2[:chain].unshift(new_edge)
+            else
+              e2[:chain] << new_edge
+            end
+            
+            # Record the extension if logging is enabled
+            if extended_pairs
+              extended_pairs << [new_edge, e1[:edge]]
+              extended_pairs << [new_edge, e2[:edge]]
+            end
+            
+            extension_count += 1
+          rescue => e
+            # If extension fails, just continue with other pairs
+            ActionLogger.log_error('chain_extension', e)
+          end
+        end
+      end
+    end
+    
+    extension_count
+  end
+
+  # Auto Layer Management
+# Returns an [r,g,b] array for a face’s front or back material, or nil
+def self.face_color(face)
+  mat = face.material || face.back_material
+  return unless mat.is_a?(Sketchup::Material)
+  col = mat.color
+  [col.red, col.green, col.blue]
+end
+
+# Group all faces whose material color matches one of our CATEGORY_COLORS
+def self.run_auto_layer_management
+  model = Sketchup.active_model
+  faces = model.active_entities.grep(Sketchup::Face)
+  buckets = Hash.new { |h, k| h[k] = [] }
+
+  faces.each do |f|
+    rgb = face_color(f)
+    next unless rgb
+    CATEGORY_COLORS.each do |category, target_rgb|
+      if color_close?(rgb, target_rgb)
+        buckets[category] << f
+        break
+      end
+    end
+  end
+
+  if buckets.empty?
+    UI.messagebox("No matching faces found for Auto Layer Management.")
+    return
+  end
+
+  model.start_operation("Auto Layer Management", true)
+  begin
+    buckets.each do |category, face_list|
+      grp = model.active_entities.add_group(face_list)
+      grp.layer = ensure_layer(category)
+      grp.name  = "#{category} Group"
+    end
+  rescue => e
+    ActionLogger.log_error('run_auto_layer_management', e)
+    UI.messagebox("❌ run_auto_layer_management error: #{e.message}")
+  ensure
+    model.commit_operation
+  end
+end
+
+
+# Site Summary Report
+def self.run_site_summary_report
+  model  = Sketchup.active_model
+  groups = model.entities.grep(Sketchup::Group)
+  areas, counts = Hash.new(0.0), Hash.new(0)
+
+  groups.each do |g|
+    tag = g.layer&.name
+    next unless CATEGORY_COLORS.key?(tag)
+    g.entities.grep(Sketchup::Face).each do |f|
+      sf = f.area * SQFT_PER_SQIN
+      areas[tag] += sf
+      counts[tag] += 1
+    end
+  end
+
+  residential_tags = [
+    'Estate Homes', 'Garden Homes', 'Bungalows',
+    'Townhomes', 'Multi-Family'
+  ]
+
+  total_sf = areas.values.sum
+  gross_acres = total_sf / SQFT_PER_ACRE
+  wetlands_sf = areas['Wetlands'] || 0.0
+  net_acres = (total_sf - wetlands_sf) / SQFT_PER_ACRE
+  total_units = residential_tags.sum { |cat| counts[cat] }
+
+  html = "<html><body><h2>Site Summary Report</h2>".dup
+
+  areas.each do |tag, sf|
+    ac = sf / SQFT_PER_ACRE
+    if residential_tags.include?(tag)
+      html << "<p><b>#{tag}:</b> #{'%.2f' % sf} sf (#{'%.2f' % ac} ac) — #{counts[tag]} lots</p>"
+    else
+      html << "<p><b>#{tag}:</b> #{'%.2f' % sf} sf (#{'%.2f' % ac} ac)</p>"
+    end
+  end
+
+  html << "<hr>"
+  html << "<p><b>Gross Acres:</b> #{'%.2f' % gross_acres} ac</p>"
+  html << "<p><b>Net Acres (excl. Wetlands):</b> #{'%.2f' % net_acres} ac</p>"
+  html << "<p><b>Total Residential Units:</b> #{total_units}</p>"
+  html << "<p><b>Units per Gross Acre:</b> #{'%.2f' % (total_units / gross_acres)}</p>"
+  html << "<p><b>Units per Net Acre:</b> #{'%.2f' % (total_units / net_acres)}</p>"
+
+  html << '</body></html>'
+  dlg = UI::HtmlDialog.new(
+    dialog_title: 'Site Summary Report',
+    preferences_key: 'site_summary',
+    scrollable: true,
+    resizable: true,
+    width: 400,
+    height: 400,
+    style: UI::HtmlDialog::STYLE_DIALOG
+  )
+  dlg.set_html(html)
+  dlg.show
+end
+
+  # Explode All Groups
+  def self.explode_all_groups
+    model = Sketchup.active_model
+    ents  = model.active_entities
+    groups = ents.grep(Sketchup::Group).reject { |g| g.name =~ /palette|snapshot/i }
+    model.start_operation('Explode All Groups', true)
+    begin
+      groups.each { |g| g.explode rescue nil }
+    rescue => e
+      ActionLogger.log_error('explode_all_groups', e)
+      UI.messagebox("❌ explode_all_groups error: #{e.message}") if defined?(UI) && UI.respond_to?(:messagebox)
+    ensure
+      model.commit_operation
+    end
+  end
+
+  # Subdivide Block Faces with Category-Based Parameters
+  def self.subdivide_block_faces_enhanced
+    model = Sketchup.active_model
+    ents = model.active_entities
+    
+    # Get user input for lot width parameters for each category
+    prompts = ['Estate Homes min width (feet)', 'Garden Homes min width (feet)', 'Bungalows min width (feet)', 'Create faces?', 'Maintain parent materials?', 'Group by lot?']
+    defaults = [80.0, 60.0, 50.0, 'Yes', 'Yes', 'Yes']
+    list = ['', '', '', 'Yes|No', 'Yes|No', 'Yes|No']
+    results = UI.inputbox(prompts, defaults, list, 'Lot Width Configuration')
+    return unless results
+    
+    # Update lot parameters with user values
+    LOT_PARAMETERS['Estate Homes'][:min_width] = results[0].to_f
+    LOT_PARAMETERS['Garden Homes'][:min_width] = results[1].to_f
+    LOT_PARAMETERS['Bungalows'][:min_width] = results[2].to_f
+    
+    create_faces = results[3] == 'Yes'
+    maintain_materials = results[4] == 'Yes'
+    group_by_lot = results[5] == 'Yes'
+    
+    # Collect selected groups
+    selected_groups = model.selection.grep(Sketchup::Group)
+    
+    # Show warning if no groups selected
+    if selected_groups.empty?
+      UI.messagebox("Please select at least one group to subdivide.") if defined?(UI) && UI.respond_to?(:messagebox)
+      return
+    end
+    
+    # Extract all faces from selected groups and determine their categories
+    group_faces = {}
+    selected_groups.each do |group|
+      # Try to determine category from group layer or name
+      group_category = detect_group_category(group)
+      
+      # If group doesn't have a recognized category, try to determine from faces
+      if !RESIDENTIAL_CATEGORIES.include?(group_category)
+        # Look at faces within the group
+        residential_faces = group.entities.grep(Sketchup::Face).select do |face|
+          face_category = detect_face_category(face)
+          RESIDENTIAL_CATEGORIES.include?(face_category)
+        end
+        
+        # Use the most common face category if available
+        if residential_faces.any?
+          category_counts = Hash.new(0)
+          residential_faces.each do |face|
+            category_counts[detect_face_category(face)] += 1
+          end
+          group_category = category_counts.max_by { |_, count| count }.first
+        end
+      end
+      
+      # Skip groups with unrecognized categories
+      unless RESIDENTIAL_CATEGORIES.include?(group_category)
+        next
+      end
+      
+      # Store all faces in this group with their detected category
+      group_faces[group] = {
+        category: group_category,
+        faces: group.entities.grep(Sketchup::Face),
+        fronts: model.selection.grep(Sketchup::Edge).select { |e| group.entities.include?(e) }
+      }
+    end
+    
+    # Check if any valid groups were found
+    if group_faces.empty?
+      UI.messagebox("None of the selected groups contain residential categories that can be subdivided: #{RESIDENTIAL_CATEGORIES.join(', ')}") if defined?(UI) && UI.respond_to?(:messagebox)
+      return
+    end
+    
+    model.start_operation('Enhanced Subdivision', true)
+    begin
+      # Track created lots for summary
+      created_lots_by_category = Hash.new(0)
+      
+      # Process each group and its faces
+      group_faces.each do |group, data|
+        group_category = data[:category]
+        faces = data[:faces]
+        fronts = data[:fronts]
+        
+        # Determine lot width based on category
+        lot_width = LOT_PARAMETERS[group_category][:min_width].feet
+        
+        # Process each face in the group
+        faces.each do |face|
+          # Store group info for later reference
+          parent_group = group
+          parent_layer = group.layer
+          parent_material = face.material
+          parent_back_material = face.back_material
+          
+          # Track original face edges for reference
+          original_edges = face.edges.to_a
+          
+          # Get edges to subdivide - either selected edges in this group or longest edge
+          edges = fronts.any? ? fronts.select { |e| face.edges.include?(e) } : [face.edges.max_by(&:length)].compact
+          
+          # Track all subdivision lines and their endpoints
+          subdivision_data = []
+          
+          # Create division lines
+          edges.each do |fe|
+            # Skip if edge too short
+            cnt = (fe.length / lot_width).floor
+            next if cnt < 1
+            
+            # Calculate perpendicular direction for rays
+            edge_vector = fe.line[1]
+            perp_vector = face.normal.cross(edge_vector).normalize
+            
+            # Calculate all subdivision points
+            (1..cnt).each do |i|
+              t = i.to_f / (cnt + 1)
+              pt = fe.point_at(t)
+              
+              # Find opposite edge intersection within the face
+              hit = model.raytest([pt, perp_vector])
+              if hit && hit[0]
+                # Create the dividing line edge within the group
+                div_edge = parent_group.entities.add_line(pt, hit[0])
+                
+                # Store subdivision data for face creation
+                subdivision_data << {
+                  start_point: pt,
+                  end_point: hit[0],
+                  edge: div_edge,
+                  parent_edge: fe,
+                  category: group_category
+                }
+              end
+            end
+          end
+          
+          # Skip face creation if not requested or no subdivisions created
+          next unless create_faces && subdivision_data.any?
+          
+          # Get all edges in the group after subdivision
+          all_edges = parent_group.entities.grep(Sketchup::Edge)
+          
+          # Find all edges that were part of or created within this face
+          face_edges = all_edges.select do |e|
+            original_edges.include?(e) || subdivision_data.any? { |sd| sd[:edge] == e }
+          end
+          
+          # Create lots by finding edge loops
+          lot_faces = []
+          
+          # Helper method to find connected edges
+          find_connected_edges = lambda do |start_point, available_edges, edge_chain = [], visited = {}, current_direction = nil|
+            connected = available_edges.select { |e| (e.start.position == start_point || e.end.position == start_point) && !visited[e] }
+            return edge_chain if connected.empty?
+            
+            # If we have a direction, prioritize edges that continue in that direction
+            if current_direction && connected.size > 1
+              # Sort by angle to current direction (smallest first)
+              connected.sort_by! do |e|
+                next_pt = (e.start.position == start_point) ? e.end.position : e.start.position
+                vector = start_point.vector_to(next_pt)
+                angle = current_direction.angle_between(vector)
+                angle
+              end
+            end
+            
+            # Try each connected edge
+            connected.each do |edge|
+              visited[edge] = true
+              edge_chain << edge
+              
+              # Determine next point and direction
+              next_pt = (edge.start.position == start_point) ? edge.end.position : edge.start.position
+              new_direction = start_point.vector_to(next_pt)
+              
+              # Recursively find next edges
+              result = find_connected_edges.call(next_pt, available_edges, edge_chain, visited, new_direction)
+              
+              # If we found a closed loop, return it
+              if result.first.start.position == result.last.end.position || 
+                 result.first.start.position == result.last.start.position ||
+                 result.first.end.position == result.last.end.position ||
+                 result.first.end.position == result.last.start.position
+                return result
+              end
+              
+              # Otherwise backtrack
+              edge_chain.pop
+              visited[edge] = false
+            end
+            
+            # No closed loop found from this edge
+            return edge_chain
+          end
+          
+          # Simple approach: identify zones bounded by original edges and subdivision lines
+          next_zone_index = 1
+          
+          # Process each subdivision line to create potential faces on either side
+          subdivision_data.each do |sd|
+            # For each subdivision line, we try to create two potential faces
+            # (one on each side of the subdividing line)
+            
+            # Find intersecting subdivision lines
+            intersecting = subdivision_data.select do |other_sd| 
+              other_sd != sd && 
+              (other_sd[:start_point] == sd[:start_point] || 
+               other_sd[:start_point] == sd[:end_point] ||
+               other_sd[:end_point] == sd[:start_point] || 
+               other_sd[:end_point] == sd[:end_point])
+            end
+            
+            # Skip if this subdivision line doesn't form corners with others
+            next if intersecting.empty?
+            
+            # Try to create a face using this subdivision line as one edge
+            # This is a simplification - in a full implementation, we'd need more robust
+            # algorithms to identify all possible closed polygons
+            
+            # Attempt to create a face directly if we have a simple quadrilateral
+            # defined by two subdivision lines and original face edges
+            if intersecting.size == 1
+              other_sd = intersecting.first
+              
+              # Check if they share exactly one point
+              shared_point = nil
+              if sd[:start_point] == other_sd[:start_point]
+                shared_point = sd[:start_point]
+              elsif sd[:start_point] == other_sd[:end_point]
+                shared_point = sd[:start_point]
+              elsif sd[:end_point] == other_sd[:start_point]
+                shared_point = sd[:end_point]
+              elsif sd[:end_point] == other_sd[:end_point]
+                shared_point = sd[:end_point]
+              end
+              
+              # If they share a point, try to create a face
+              if shared_point
+                # Get the three corner points of the potential face
+                corners = [
+                  sd[:start_point] == shared_point ? sd[:end_point] : sd[:start_point],
+                  shared_point,
+                  other_sd[:start_point] == shared_point ? other_sd[:end_point] : other_sd[:start_point]
+                ]
+                
+                # Find the fourth corner by ray intersection
+                direction1 = corners[0].vector_to(corners[1])
+                direction2 = corners[2].vector_to(corners[1])
+                
+                # Create the face if possible
+                begin
+                  # Create a group for this lot if requested
+                  lot_group = nil
+                  lot_entities = nil
+                  
+                  if group_by_lot
+                    # Create nested group within the parent group
+                    lot_group = parent_group.entities.add_group
+                    lot_group.name = "#{group_category} Lot #{next_zone_index}"
+                    lot_group.layer = parent_layer if parent_layer
+                    lot_entities = lot_group.entities
+                  else
+                    # Add directly to parent group
+                    lot_entities = parent_group.entities
+                  end
+                  
+                  # Try to create face by adding necessary edges and connecting corners
+                  lot_face = lot_entities.add_face(corners)
+                  
+                  # Apply materials if requested
+                  if maintain_materials && lot_face
+                    lot_face.material = parent_material if parent_material
+                    lot_face.back_material = parent_back_material if parent_back_material
+                  end
+                  
+                  # Track the created face and increment category counter
+                  if lot_face
+                    lot_faces << lot_face
+                    created_lots_by_category[group_category] += 1
+                    next_zone_index += 1
+                  end
+                rescue => e
+                  ActionLogger.log_error('lot_face_creation', e)
+                  # Just continue to the next attempt if this one fails
+                end
+              end
+            end
+          end
+          
+          # More comprehensive approach for complex subdivisions
+          if lot_faces.empty? && subdivision_data.any?
+            # Alternative approach: use SketchUp's native face finding
+            # When direct face creation fails, we can try to let SketchUp find faces
+            # after creating all necessary edges
+            
+            # First, ensure all necessary edges exist
+            subdivision_data.each do |sd|
+              # If the edge was created earlier but doesn't exist now,
+              # recreate it to ensure all boundaries are present
+              unless sd[:edge].valid?
+                sd[:edge] = parent_group.entities.add_line(sd[:start_point], sd[:end_point])
+              end
+            end
+            
+            # Let SketchUp try to find faces automatically
+            parent_group.entities.grep(Sketchup::Face).each do |new_face|
+              # Check if this is a face we just created
+              if new_face.valid? && !faces.include?(new_face)
+                # Apply materials if requested
+                if maintain_materials
+                  new_face.material = parent_material if parent_material
+                  new_face.back_material = parent_back_material if parent_back_material
+                end
+                
+                # Create a group for this lot if requested
+                if group_by_lot
+                  lot_group = parent_group.entities.add_group
+                  lot_group.name = "#{group_category} Lot #{next_zone_index}"
+                  lot_group.layer = parent_layer if parent_layer
+                  
+                  # Move the face to the group
+                  lot_face = lot_group.entities.add_face(new_face.vertices.map(&:position))
+                  
+                  # Apply materials to the grouped face
+                  if maintain_materials && lot_face
+                    lot_face.material = parent_material if parent_material
+                    lot_face.back_material = parent_back_material if parent_back_material
+                  end
+                  
+                  # Delete the original face since we've moved it into a group
+                  new_face.erase! if new_face.valid?
+                  created_lots_by_category[group_category] += 1
+                  next_zone_index += 1
+                end
+              end
+            end
+          end
+        end
+      end
+      
+      # Inform user of results with category breakdown
+      if create_faces
+        message = "Subdivision complete.\n\n"
+        created_lots_by_category.each do |category, count|
+          if count > 0
+            message += "#{category}: #{count} lots\n"
+          end
+        end
+        if defined?(UI) && UI.respond_to?(:messagebox)
+          UI.messagebox(message)
+        end
+      else
+        if defined?(UI) && UI.respond_to?(:messagebox)
+          UI.messagebox("Subdivision lines created.")
+        end
+      end
+    rescue => e
+      ActionLogger.log_error('enhanced_subdivision', e)
+      if defined?(UI) && UI.respond_to?(:messagebox)
+        UI.messagebox("❌ Enhanced subdivision error: #{e.message}")
+      end
+    ensure
+      model.commit_operation
+    end
+  end
+
+  # Helper method to detect face category based on color
+  def self.detect_face_category(face)
+    face_color = self.face_color(face)
+    return "Unknown" unless face_color
+    
+    # Check if face color matches any category
+    CATEGORY_COLORS.each do |category, rgb|
+      return category if color_close?(face_color, rgb)
+    end
+    
+    # If face has a layer that matches a category, use that
+    if face.layer && CATEGORY_COLORS.key?(face.layer.name)
+      return face.layer.name
+    end
+    
+    # Check parent group's layer if any
+    model = Sketchup.active_model
+    model.entities.grep(Sketchup::Group).each do |g|
+      if g.entities.include?(face) && g.layer && CATEGORY_COLORS.key?(g.layer.name)
+        return g.layer.name
+      end
+    end
+    
+    "Unknown"
+  end
+
+  # Helper method to detect group category based on layer or name
+  def self.detect_group_category(group)
+    # First check the group's layer
+    if group.layer && CATEGORY_COLORS.key?(group.layer.name)
+      return group.layer.name
+    end
+    
+    # Check if the group name contains a category
+    RESIDENTIAL_CATEGORIES.each do |category|
+      if group.name.include?(category)
+        return category
+      end
+    end
+    
+    # Try to detect from the most common face category
+    face_categories = Hash.new(0)
+    group.entities.grep(Sketchup::Face).each do |face|
+      category = detect_face_category(face)
+      face_categories[category] += 1 if RESIDENTIAL_CATEGORIES.include?(category)
+    end
+    
+    # Return the most common category if any
+    return face_categories.max_by { |_, count| count }&.first || "Unknown" if face_categories.any?
+    
+    "Unknown"
+  end
+
+  # Flip All Faces Upward
+  def self.flip_faces_upward
+    model = Sketchup.active_model
+    faces = model.active_entities.grep(Sketchup::Face)
+    model.start_operation('Flip All Faces Upward', true)
+    begin
+      faces.each { |f| f.reverse! if f.normal.z < 0 }
+    rescue => e
+      ActionLogger.log_error('flip_faces_upward', e)
+      UI.messagebox("❌ flip_faces_upward error: #{e.message}")
+    ensure
+      model.commit_operation
+    end
+  end
+
+  # Color Palette Dialog
+  def self.draw_color_palette
+    html = <<~HTML.dup
+      <html><head><style>
+        body{font-family:sans-serif;margin:10px}
+        table{border-collapse:collapse;width:100%}
+        td{padding:4px}
+        .swatch{width:24px;height:24px;border:1px solid #000}
+      </style></head><body>
+      <h2>Color Palette</h2><table>
+    HTML
+    CATEGORY_COLORS.each do |name, rgb|
+      hex = sprintf('#%02X%02X%02X', *rgb)
+      html << "<tr><td><div class='swatch' style='background:#{hex}'></div></td><td>#{name} — RGB(#{rgb.join(',')}) — #{hex}</td></tr>"
+    end
+    html << '</table></body></html>'
+    dlg = UI::HtmlDialog.new(dialog_title: 'Color Palette', preferences_key: 'palette', scrollable: true, resizable: true, width: 400, height: 300, style: UI::HtmlDialog::STYLE_DIALOG)
+    dlg.set_html(html)
+    dlg.show
+  end
+
+  # Self-Test
+  def self.run_self_test
+    results = {}
+    tests = {
+      'Dissect Model'    => method(:dissect_model),
+      'Fix Edges'        => method(:fix_edges),
+      'Auto Layers'      => method(:run_auto_layer_management),
+      'Site Summary'     => method(:run_site_summary_report),
+      'Explode Groups'   => method(:explode_all_groups),
+      'Subdivide Blocks' => method(:subdivide_block_faces_enhanced),
+      'Flip Faces'       => method(:flip_faces_upward),
+      'Color Palette'    => method(:draw_color_palette),
+    }
+    tests.each do |name, fn|
+      begin
+        fn.call
+        results[name] = 'OK'
+      rescue => e
+        ActionLogger.log_error(name, e)
+        results[name] = "Error: #{e.message}"
+      end
+    end
+    UI.messagebox(results.map { |k, v| "#{k}: #{v}" }.join("
+"))
+  end
+
+  # Entry point for enhanced edge cleanup menu
+  # @return [void]
+  def self.enhanced_fix_edges_menu
+    show_tag_selection_dialog
+  end
+
+  # Shows dialog for selecting tags to process
+  # @return [void]
+  def self.show_tag_selection_dialog
+    model = Sketchup.active_model
+    tags = model.layers.map(&:name)  # SketchUp "tags" API is in model.layers
+
+    # Create the dialog
+    dlg = UI::HtmlDialog.new(
+      dialog_title:    "Select Tags for Edge Cleanup",
+      preferences_key: "SDA_tag_selector",
+      scrollable:      true,
+      resizable:       true,
+      width:           600,
+      height:          700,
+      style:           UI::HtmlDialog::STYLE_DIALOG
+    )
+
+    # Build a simple HTML form with a checkbox per tag
+    html = <<~HTML
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <style>
+          body { font-family: system-ui, -apple-system, sans-serif; margin: 20px; }
+          h3 { margin-top: 0; color: #333; }
+          .tag-list { 
+            max-height: 300px; 
+            overflow-y: auto; 
+            border: 1px solid #ddd; 
+            border-radius: 4px;
+            padding: 10px;
+            margin-bottom: 15px;
+          }
+          .tag-item { 
+            margin: 8px 0; 
+            display: flex;
+            align-items: center;
+          }
+          .tag-item input {
+            margin-right: 8px;
+            width: 16px;
+            height: 16px;
+          }
+          .controls {
+            margin-top: 20px;
+            display: flex;
+            justify-content: space-between;
+          }
+          .param-group {
+            margin-bottom: 15px;
+            padding: 10px;
+            border: 1px solid #eee;
+            border-radius: 4px;
+          }
+          .param-group h4 {
+            margin-top: 0;
+            margin-bottom: 10px;
+            color: #555;
+          }
+          .param-row {
+            display: flex;
+            align-items: center;
+            margin-bottom: 20px;
+          }
+          .param-row label {
+            flex: 1;
+          }
+          .param-row input[type="number"] {
+            width: 80px;
+            margin-right: 20px;
+          }
+          .param-row input[type="checkbox"] {
+            margin-right: 20px;
+          }
+          .diagram {
+            margin-left: 10px;
+            border: 1px solid #eee;
+            border-radius: 4px;
+            padding: 5px;
+          }
+          .diagram-title {
+            font-size: 12px;
+            color: #666;
+            text-align: center;
+            margin-top: 5px;
+          }
+          .param-description {
+            font-size: 12px;
+            color: #666;
+            margin-top: 5px;
+            max-width: 500px;
+          }
+          button {
+            padding: 8px 16px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+          }
+          button:hover {
+            background-color: #45a049;
+          }
+          button#cancel {
+            background-color: #f44336;
+          }
+          button#cancel:hover {
+            background-color: #d32f2f;
+          }
+          .select-all {
+            margin-bottom: 10px;
+            color: #0066cc;
+            cursor: pointer;
+            user-select: none;
+            display: inline-block;
+          }
+          .select-all:hover {
+            text-decoration: underline;
+          }
+          .columns {
+            display: flex;
+          }
+          .column {
+            flex: 1;
+          }
+          .advanced-options {
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px dashed #ccc;
+          }
+          .advanced-options h4 {
+            color: #666;
+          }
+        </style>
+      </head>
+      <body>
+        <h3>Select Tags to Clean</h3>
+        
+        <div class="select-all" id="select-all">Select All</div> | 
+        <div class="select-all" id="deselect-all">Deselect All</div>
+        
+        <div class="tag-list">
+          #{tags.map { |t| "<div class='tag-item'><label><input type='checkbox' value='#{t}'> #{t}</label></div>" }.join}
+        </div>
+        
+        <div class="param-group">
+          <h4>Cleanup Parameters</h4>
+          
+          <div class="param-row">
+            <div class="column">
+              <label for="stray-threshold">Tiny stray threshold (inches):</label>
+              <input type="number" id="stray-threshold" value="#{STRAY_THRESHOLD_DEFAULT}" step="0.1" min="0.1">
+              <div class="param-description">
+                Edges shorter than this threshold will be removed as "stray" edges. This helps clean up tiny, disconnected edge fragments.
+              </div>
+            </div>
+            <div class="diagram">
+              <svg width="150" height="100" viewBox="0 0 150 100">
+                <line x1="20" y1="50" x2="120" y2="50" stroke="#555" stroke-width="2"/>
+                <line x1="50" y1="30" x2="65" y2="30" stroke="#f44336" stroke-width="2"/>
+                <line x1="90" y1="70" x2="100" y2="80" stroke="#f44336" stroke-width="2"/>
+                <text x="60" y="20" fill="#f44336" style="font-size: 10px;">Stray edges</text>
+                <text x="20" y="90" fill="#555" style="font-size: 10px;">Threshold: #{STRAY_THRESHOLD_DEFAULT} inch</text>
+              </svg>
+              <div class="diagram-title">Stray edge removal</div>
+            </div>
+          </div>
+          
+          <div class="param-row">
+            <div class="column">
+              <label for="vertex-tolerance">Vertex merge tolerance (inches):</label>
+              <input type="number" id="vertex-tolerance" value="#{VERTEX_TOLERANCE_DEFAULT}" step="0.001" min="0.001">
+              <div class="param-description">
+                Vertices closer than this distance will be merged. This fixes tiny gaps and disconnected geometry.
+              </div>
+            </div>
+            <div class="diagram">
+              <svg width="150" height="100" viewBox="0 0 150 100">
+                <circle cx="50" cy="50" r="3" fill="#555"/>
+                <circle cx="54" cy="52" r="3" fill="#f44336"/>
+                <circle cx="90" cy="50" r="3" fill="#4CAF50"/>
+                <line x1="50" y1="50" x2="90" y2="50" stroke="#555" stroke-width="2"/>
+                <line x1="54" y1="52" x2="90" y2="50" stroke="#f44336" stroke-width="2" stroke-dasharray="3,3"/>
+                <circle cx="70" cy="30" r="10" stroke="#4CAF50" stroke-width="1" fill="none"/>
+                <line x1="62" y1="30" x2="78" y2="30" stroke="#4CAF50" stroke-width="1"/>
+                <line x1="70" y1="22" x2="70" y2="38" stroke="#4CAF50" stroke-width="1"/>
+                <text x="20" y="80" fill="#555" style="font-size: 10px;">Tolerance: #{VERTEX_TOLERANCE_DEFAULT} inch</text>
+              </svg>
+              <div class="diagram-title">Close vertices merged</div>
+            </div>
+          </div>
+          
+          <div class="param-row">
+            <div class="column">
+              <label for="colinear-tolerance">Colinear angle tolerance (degrees):</label>
+              <input type="number" id="colinear-tolerance" value="#{COLINEAR_ANGLE_DEFAULT}" step="0.1" min="0.1">
+              <div class="param-description">
+                Edges that form an angle smaller than this value will be merged into a single edge if they share an endpoint. This simplifies geometry by removing unnecessary vertices.
+              </div>
+            </div>
+            <div class="diagram">
+              <svg width="150" height="100" viewBox="0 0 150 100">
+                <line x1="20" y1="50" x2="70" y2="50" stroke="#555" stroke-width="2"/>
+                <line x1="70" y1="50" x2="120" y2="48" stroke="#555" stroke-width="2"/>
+                <line x1="20" y1="50" x2="120" y2="48" stroke="#4CAF50" stroke-width="2" stroke-dasharray="3,3"/>
+                <path d="M 70,50 A 20,20 0 0,1 80,45" stroke="#f44336" fill="none"/>
+                <text x="80" y="42" fill="#f44336" style="font-size: 10px;">#{COLINEAR_ANGLE_DEFAULT}°</text>
+                <circle cx="70" cy="50" r="3" fill="#555"/>
+                <text x="20" y="80" fill="#555" style="font-size: 10px;">Before</text>
+                <text x="90" y="80" fill="#4CAF50" style="font-size: 10px;">After</text>
+              </svg>
+              <div class="diagram-title">Colinear segments merged</div>
+            </div>
+          </div>
+          
+          <div class="param-row">
+            <div class="column">
+              <label for="create-faces">Create faces in closed loops:</label>
+              <input type="checkbox" id="create-faces">
+              <div class="param-description">
+                When enabled, the tool will automatically create faces from closed loops of edges. This helps complete geometry where faces are missing.
+              </div>
+            </div>
+            <div class="diagram">
+              <svg width="150" height="100" viewBox="0 0 150 100">
+                <polygon points="30,30 100,30 100,70 30,70" stroke="#555" fill="none" stroke-width="2"/>
+                <polygon points="30,30 100,30 100,70 30,70" stroke="none" fill="#4CAF5033" class="face-fill"/>
+                <text x="45" y="55" fill="#4CAF50" class="face-text" style="font-size: 10px;">New Face</text>
+                <rect x="20" y="80" width="10" height="10" stroke="none" fill="#4CAF5033"/>
+                <text x="35" y="88" fill="#555" style="font-size: 10px;">Created face</text>
+              </svg>
+              <div class="diagram-title">Face creation</div>
+            </div>
+          </div>
+          
+          <div class="param-row">
+            <div class="column">
+              <label for="process-entire-model">Process entire model:</label>
+              <input type="checkbox" id="process-entire-model" checked>
+              <div class="param-description">
+                When enabled, the tool will process the entire model. When disabled, only the current selection will be processed.
+              </div>
+            </div>
+            <div class="diagram">
+              <svg width="150" height="100" viewBox="0 0 150 100">
+                <rect x="35" y="20" width="80" height="60" stroke="#555" fill="none" stroke-width="1"/>
+                <circle cx="50" cy="40" r="10" stroke="#4CAF50" fill="none" stroke-width="2"/>
+                <rect x="75" y="35" width="20" height="30" stroke="#4CAF50" fill="none" stroke-width="2"/>
+                <rect x="35" y="20" width="80" height="60" stroke="#f44336" fill="none" stroke-width="2" stroke-dasharray="3,3" class="entire-model"/>
+                <text x="35" y="90" fill="#555" style="font-size: 10px;">Selection vs. Entire Model</text>
+              </svg>
+              <div class="diagram-title">Processing scope</div>
+            </div>
+          </div>
+          
+          <div class="advanced-options">
+            <h4>Advanced Options</h4>
+            <div class="param-row">
+              <div class="column">
+                <label for="log-changes">Generate detailed change log:</label>
+                <input type="checkbox" id="log-changes" checked>
+                <div class="param-description">
+                  Creates a JSON log file in the model folder with details of all changes made, including coordinates, entity IDs, and types of operations.
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        <div class="controls">
+          <button id="ok">Run Cleanup</button>
+          <button id="cancel">Cancel</button>
+        </div>
+        
+        <script>
+          // Update diagram visuals when parameters change
+          document.getElementById('create-faces').addEventListener('change', function() {
+            const faceFill = document.querySelector('.face-fill');
+            const faceText = document.querySelector('.face-text');
+            if (this.checked) {
+              faceFill.setAttribute('fill', '#4CAF5033');
+              faceText.setAttribute('fill', '#4CAF50');
+            } else {
+              faceFill.setAttribute('fill', 'none');
+              faceText.setAttribute('fill', 'none');
+            }
+          });
+          
+          document.getElementById('process-entire-model').addEventListener('change', function() {
+            const entireModel = document.querySelector('.entire-model');
+            if (this.checked) {
+              entireModel.setAttribute('stroke', '#f44336');
+            } else {
+              entireModel.setAttribute('stroke', 'none');
+            }
+          });
+          
+          // Select/deselect all functionality
+          document.getElementById('select-all').addEventListener('click', () => {
+            document.querySelectorAll('.tag-list input[type=checkbox]').forEach(cb => {
+              cb.checked = true;
+            });
+          });
+          
+          document.getElementById('deselect-all').addEventListener('click', () => {
+            document.querySelectorAll('.tag-list input[type=checkbox]').forEach(cb => {
+              cb.checked = false;
+            });
+          });
+          
+          // Send selection back to Ruby
+          const sendSelection = () => {
+            const checked = Array.from(document.querySelectorAll('.tag-list input[type=checkbox]:checked'))
+                                .map(cb => cb.value);
+            
+            // Get parameter values
+            const params = {
+              strayThreshold: document.getElementById('stray-threshold').value,
+              vertexTolerance: document.getElementById('vertex-tolerance').value,
+              colinearTolerance: document.getElementById('colinear-tolerance').value,
+              createFaces: document.getElementById('create-faces').checked,
+              processEntireModel: document.getElementById('process-entire-model').checked,
+              logChanges: document.getElementById('log-changes').checked
+            };
+            
+            // Call back into Ruby with both tags and parameters
+            sketchup.selectTags(JSON.stringify({
+              tags: checked,
+              params: params
+            }));
+          };
+          
+          document.getElementById('ok').addEventListener('click', sendSelection);
+          document.getElementById('cancel').addEventListener('click', () => {
+            sketchup.closeDialog();
+          });
+        </script>
+      </body>
+      </html>
+    HTML
+
+    dlg.set_html(html)
+
+    # Ruby‐side callbacks:
+    dlg.add_action_callback("selectTags") do |action_context, json_data|
+      # Use the captured dlg variable instead of the action_context
+      dlg.close
+      begin
+        data = JSON.parse(json_data)
+        selected_tags = data['tags']
+        params = data['params']
+        
+        # Now call the real cleanup with those tags
+        enhanced_fix_edges_for_tags(
+          selected_tags,
+          stray_threshold: params['strayThreshold'].to_f.inch,
+          vertex_tolerance: params['vertexTolerance'].to_f.inch,
+          colinear_tolerance: params['colinearTolerance'].to_f.degrees,
+          create_faces: params['createFaces'],
+          process_entire_model: params['processEntireModel'],
+          log_changes: params['logChanges']
+        )
+      rescue => e
+        ActionLogger.log_error('tag_selection', e)
+        UI.messagebox("❌ Failed to start cleanup: #{e.message}")
+      end
+    end
+
+    dlg.add_action_callback("closeDialog") do |action_context, _|
+      # Use the captured dlg variable instead of the action_context
+      dlg.close
+    end
+
+    dlg.show
+  end
+
+  # Helper method to check for escape key to allow cancellation
+  # @return [Boolean] true if escape key is pressed
+  def self.escape_pressed?
+    # Use Sketchup's input system to check if Escape key is pressed
+    return false unless Sketchup.respond_to?(:is_key_down)
+    # VK_ESCAPE = 27
+    Sketchup.is_key_down(27)
+  end
+
+  # Helper method to generate a change log path for this model
+  # @param model [Sketchup::Model] the model to generate a log path for
+  # @return [String] path to the log file
+  def self.cleanup_log_path(model)
+    # Get the model path if available
+    if model.path && !model.path.empty?
+      model_dir = File.dirname(model.path)
+      model_name = File.basename(model.path, ".*")
+      
+      # Create a logs subfolder
+      logs_dir = File.join(model_dir, "logs")
+      FileUtils.mkdir_p(logs_dir) unless Dir.exist?(logs_dir)
+      
+      # Create timestamped log file
+      timestamp = Time.now.strftime("%Y%m%d_%H%M%S")
+      File.join(logs_dir, "#{model_name}_cleanup_#{timestamp}.json")
+    else
+      # If model is not saved, use a temporary file
+      temp_dir = File.join(ENV['TEMP'] || ENV['TMP'] || Dir.tmpdir, "sketchup_logs")
+      FileUtils.mkdir_p(temp_dir) unless Dir.exist?(temp_dir)
+      
+      timestamp = Time.now.strftime("%Y%m%d_%H%M%S")
+      File.join(temp_dir, "unsaved_model_cleanup_#{timestamp}.json")
+    end
+  end
+  
+  # Helper to write a change log entry
+  # @param log_entries [Array] log entries to append to
+  # @param type [String] type of operation
+  # @param entity [Sketchup::Entity] entity being operated on
+  # @param details [Hash] additional details about the operation
+  # @return [void]
+  def self.log_cleanup_change(log_entries, type, entity, details = {})
+    return unless log_entries
+    
+    begin
+      # Check if the entity is still valid
+      valid_entity = entity && (entity.valid? rescue false)
+      
+      entry = {
+        type: type,
+        id: valid_entity && entity.respond_to?(:persistent_id) ? entity.persistent_id : nil,
+        entity_type: entity ? entity.class.name : 'Unknown',
+        tag: valid_entity && entity.respond_to?(:layer) && entity.layer ? entity.layer.name : nil,
+        timestamp: Time.now.to_i
+      }
+      
+      # Add specific entity details based on type - only if entity is valid
+      if valid_entity
+        if entity.is_a?(Sketchup::Edge)
+          if entity.start && entity.end && 
+             (entity.start.valid? rescue false) && 
+             (entity.end.valid? rescue false)
+            begin
+              start_pos = entity.start.position
+              end_pos = entity.end.position
+              
+              entry[:start_point] = [start_pos.x, start_pos.y, start_pos.z]
+              entry[:end_point] = [end_pos.x, end_pos.y, end_pos.z]
+              entry[:length] = entity.length
+            rescue => e
+              # If can't get valid positions, add error info
+              entry[:position_error] = e.message
+            end
+          end
+        elsif entity.is_a?(Sketchup::Face)
+          begin
+            # Get valid vertices only
+            valid_vertices = entity.vertices.select { |v| v && (v.valid? rescue false) }
+            if valid_vertices.any?
+              entry[:vertices] = valid_vertices.map do |v|
+                position = v.position
+                [position.x, position.y, position.z]
+              end
+            end
+            
+            entry[:area] = entity.area
+          rescue => e
+            # If can't get valid face data, add error info
+            entry[:face_error] = e.message
+          end
+        end
+      end
+      
+      # Add any additional details
+      entry.merge!(details) if details && !details.empty?
+      
+      log_entries << entry
+    rescue => e
+      # Catch any error in the logging process
+      if defined?(ActionLogger) && ActionLogger.respond_to?(:log_error)
+        ActionLogger.log_error('log_cleanup_change', e)
+      end
+    end
+  end
+
+  # Helper method to safely update status text
+  # @param text [String] Text to display in the status bar
+  # @return [void]
+  def self.update_status_text(text)
+    if defined?(Sketchup) && Sketchup.respond_to?(:status_text=)
+      Sketchup.status_text = text
+    end
+  end
+
+  # Core edge cleanup implementation that accepts pre-selected tags
+  # @param selected_tags [Array<String>] Array of tag names to process
+  # @param stray_threshold [Float] Threshold for removing tiny stray edges
+  # @param vertex_tolerance [Float] Tolerance for merging vertices
+  # @param colinear_tolerance [Float] Angle tolerance for merging colinear segments
+  # @param create_faces [Boolean] Whether to create faces in closed loops
+  # @param process_entire_model [Boolean] Whether to process the entire model or selection
+  # @param log_changes [Boolean] Whether to generate a detailed log of all changes
+  # @return [void]
+  def self.enhanced_fix_edges_for_tags(selected_tags,
+                                      stray_threshold: CLEANUP_DEFAULTS[:stray],
+                                      vertex_tolerance: CLEANUP_DEFAULTS[:vertex_tol],
+                                      colinear_tolerance: CLEANUP_DEFAULTS[:colinear_deg],
+                                      create_faces: false,
+                                      process_entire_model: true,
+                                      log_changes: true)
+    model = Sketchup.active_model
+    
+    # Create progress tracking variables
+    progress = 0
+    steps_total = 6 # Total number of major steps in our process
+    start_time = Time.now
+    
+    # Start the operation
+    model.start_operation('Enhanced Edge Cleanup', true)
+    
+    begin
+      # Update status bar
+      self.update_status_text("Edge Cleanup: Collecting edges to process... (#{progress}/#{steps_total}) [Press ESC to cancel]")
+      
+      # Determine which entities to process
+      if process_entire_model
+        ents = model.entities
+      else
+        # See if a group or component is selected
+        selection = model.selection
+        if selection.length == 1 && (selection[0].is_a?(Sketchup::Group) || selection[0].is_a?(Sketchup::ComponentInstance))
+          if selection[0].is_a?(Sketchup::Group)
+            ents = selection[0].entities
+          else
+            ents = selection[0].definition.entities
+          end
+        else
+          ents = model.active_entities
+        end
+      end
+      
+      # Update progress
+      progress += 1
+      elapsed = Time.now - start_time
+      eta = elapsed * (steps_total - progress) / progress rescue "calculating..."
+      self.update_status_text("Edge Cleanup: Removing stray edges... (#{progress}/#{steps_total}, ETA: #{eta.round}s) [Press ESC to cancel]")
+      
+      # Check for cancel
+      if escape_pressed?
+        model.abort_operation
+        self.show_message("Edge cleanup cancelled by user.")
+        return
+      end
+      
+      # 1. Collect all edges to process based on tag selection
+      all_edges = []
+      begin
+        # Safely get all valid edges
+        all_edges = ents.grep(Sketchup::Edge).select { |edge| edge && (edge.valid? rescue false) }
+      rescue => e
+        ActionLogger.log_error('edge_collection', e)
+        self.show_message("Error collecting edges: #{e.message}")
+        model.abort_operation
+        return
+      end
+      
+      # Filter by tag if tags are provided
+      if selected_tags && !selected_tags.empty?
+        edges_to_process = all_edges.select do |edge|
+          begin
+            edge.layer && selected_tags.include?(edge.layer.name.to_s)
+          rescue => e
+            # If we can't access the layer, skip this edge
+            ActionLogger.log_error('edge_layer_access', e) if log_changes
+            false
+          end
+        end
+        
+        # If no edges match the tag filter, use all valid edges
+        if edges_to_process.empty?
+          edges_to_process = all_edges
+        end
+      else
+        edges_to_process = all_edges
+      end
+      
+      # 2. Remove tiny stray edges (collect first, then erase)
+      edges_to_erase = []
+      stray_count = 0
+      
+      edges_to_process.each_with_index do |edge, index|
+        begin
+          # Skip already invalid edges
+          next unless edge && (edge.valid? rescue false)
+          
+          if edge.length < stray_threshold
+            edges_to_erase << edge
+            stray_count += 1
+          end
+        rescue => e
+          # Log error but continue with other edges
+          ActionLogger.log_error('stray_edge_check', e) if log_changes
+        end
+        
+        # Check for cancel every 1000 edges
+        if index % 1000 == 0 && escape_pressed?
+          model.abort_operation
+          self.show_message("Edge cleanup cancelled by user.")
+          return
+        end
+      end
+      
+      # Now erase all strays at once
+      erase_edges(edges_to_erase)
+      
+      # Update progress
+      progress += 1
+      self.update_status_text("Edge Cleanup: Merging vertices... (#{progress}/#{steps_total}) [Press ESC to cancel]")
+      
+      # Refresh our edge list to remove any that were erased
+      edges_to_process.select! { |edge| edge && (edge.valid? rescue false) }
+      
+      # 3. Merge duplicate vertices (those closer than tolerance)
+      merged_count = merge_close_vertices!(ents, edges_to_process, vertex_tolerance)
+      
+      # Check for cancel
+      if escape_pressed?
+        model.abort_operation
+        self.show_message("Edge cleanup cancelled by user.")
+        return
+      end
+      
+      # Update progress
+      progress += 1
+      self.update_status_text("Edge Cleanup: Purging unused entities... (#{progress}/#{steps_total}) [Press ESC to cancel]")
+      
+      # 4. Purge unused entities if possible
+      begin
+        ents.purge_unused(true) if ents.respond_to?(:purge_unused)
+      rescue => e
+        # Log error but continue
+        ActionLogger.log_error('purge_unused', e) if log_changes
+      end
+      
+      # Update progress
+      progress += 1
+      self.update_status_text("Edge Cleanup: Building edge chains... (#{progress}/#{steps_total}) [Press ESC to cancel]")
+      
+      # Get current valid edges after all our operations
+      current_edges = []
+      begin
+        current_edges = ents.grep(Sketchup::Edge).select { |edge| edge && (edge.valid? rescue false) }
+      rescue => e
+        ActionLogger.log_error('current_edge_collection', e) if log_changes
+      end
+      
+      # 5. Build chains of edges
+      chains = build_enhanced_edge_chains(current_edges)
+      
+      # Remove any stray nils from every chain right after building them
+      chains.each(&:compact!)
+      chains.reject!(&:empty?)
+      
+      # Update progress
+      progress += 1
+      self.update_status_text("Edge Cleanup: Merging colinear segments... (#{progress}/#{steps_total}) [Press ESC to cancel]")
+      
+      # 6. Merge colinear segments within chains
+      colinear_merged = 0
+      chains.each do |chain|
+        begin
+          colinear_merged += merge_colinear_segments(chain, ents, colinear_tolerance)
+        rescue => e
+          # Log error but continue with other chains
+          ActionLogger.log_error('colinear_merge', e) if log_changes
+        end
+        
+        # Check for cancel periodically
+        if escape_pressed?
+          model.abort_operation
+          self.show_message("Edge cleanup cancelled by user.")
+          return
+        end
+      end
+      
+      # Update to remove any invalid edges after merging
+      chains.each do |chain|
+        chain.select! { |edge| edge && (edge.valid? rescue false) }
+      end
+      chains.reject!(&:empty?)
+      
+      # Update progress
+      progress += 1
+      self.update_status_text("Edge Cleanup: Extending chains... (#{progress}/#{steps_total}) [Press ESC to cancel]")
+      
+      # 7. Extend chains where possible
+      extended = 0
+      begin
+        extended = extend_enhanced_chains(chains, ents, model)
+      rescue => e
+        # Log error but continue
+        ActionLogger.log_error('chain_extension', e) if log_changes
+      end
+      
+      # 8. Create faces in closed loops if requested
+      faces_created = 0
+      if create_faces
+        begin
+          faces_created = build_faces_from_loops!(chains, ents)
+        rescue => e
+          # Log error but continue
+          ActionLogger.log_error('face_creation', e) if log_changes
+        end
+      end
+      
+      # Reset status bar
+      self.update_status_text("")
+      
+      # Calculate total time
+      total_time = Time.now - start_time
+      time_str = total_time < 60 ? "#{total_time.round(1)}s" : "#{(total_time / 60).floor}m #{(total_time % 60).round}s"
+      
+      # Report results
+      result_message = "Edge cleanup complete (#{time_str}):\n"
+      result_message += "• #{stray_count} tiny stray edges removed\n"
+      result_message += "• #{merged_count} duplicate vertices merged\n"
+      result_message += "• #{colinear_merged} colinear segments merged\n"
+      result_message += "• #{extended} chain endpoints extended\n"
+      result_message += "• #{faces_created} faces created" if create_faces
+      
+      self.show_message(result_message)
+    rescue => e
+      ActionLogger.log_error('enhanced_fix_edges', e)
+      self.show_message("❌ Enhanced edge cleanup error: #{e.message}")
+      model.abort_operation
+      return
+    ensure
+      begin
+        model.commit_operation
+      rescue => e
+        ActionLogger.log_error('commit_operation', e)
+        model.abort_operation rescue nil
+      end
+      self.update_status_text("") # Ensure status text is cleared even if there's an error
+    end
+  end
+
+  # Helper method to safely show a message box
+  # @param message [String] Message to display
+  # @return [void]
+  def self.show_message(message)
+    if defined?(UI) && UI.respond_to?(:messagebox)
+      UI.messagebox(message)
+    end
+  end
+
+  # Menu Installation
+  unless @installed
+    menu = UI.menu('Extensions').add_submenu('🧰 Stringfellow Design Assistant')
+    menu.add_item('🔧 Fix Edges')                    { StringfellowDesignAssistant.fix_edges }
+    menu.add_item('🔧 Enhanced Edge Cleanup...')     { StringfellowDesignAssistant.enhanced_fix_edges_menu }
+    menu.add_item('⤴️ Flip All Faces Upward')         { StringfellowDesignAssistant.flip_faces_upward }
+    menu.add_item('🎨 Color Palette')                { StringfellowDesignAssistant.draw_color_palette }
+    menu.add_item('📏 Subdivide Block Faces')        { StringfellowDesignAssistant.subdivide_block_faces_enhanced }
+    menu.add_item('⚙️ Auto Layer Management')       { StringfellowDesignAssistant.run_auto_layer_management }
+    menu.add_item('📊 Site Summary Report')          { StringfellowDesignAssistant.run_site_summary_report }
+    menu.add_item('💣 Explode All Groups')           { StringfellowDesignAssistant.explode_all_groups }
+    menu.add_item('🧩 Dissect Model → JSON')         { StringfellowDesignAssistant.dissect_model }
+    menu.add_separator
+    menu.add_item('🔬 Run Self-Test')                { StringfellowDesignAssistant.run_self_test }
+    @installed = true
+  end
+
+  # Helper method for building faces
+  def self.build_face_perimeter_from_edges(edges)
+    edges.map do |e| 
+      begin
+        # Safely get positions if edge is valid
+        if e && (e.valid? rescue false) && 
+           e.start && (e.start.valid? rescue false) && 
+           e.end && (e.end.valid? rescue false)
+          [e.start.position, e.end.position]
+        else
+          []
+        end
+      rescue => ex
+        ActionLogger.log_error('get_edge_perimeter', ex) if defined?(ActionLogger)
+        []
+      end
+    end.flatten.compact.uniq
+  end
+end
+
+file_loaded(__FILE__)
